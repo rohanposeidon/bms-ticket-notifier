@@ -91,6 +91,9 @@ class ShowInfo:
     time_code: str
     screen_attr: str
     categories: list[CatInfo] = field(default_factory=list)
+    event_code: str = ""
+    language: str = ""
+    format: str = ""
 
 @dataclass
 class DateInfo:
@@ -183,14 +186,16 @@ def fetch_bms(event_code, date_code, region_code, region_slug,
 # PARSERS
 # ──────────────────────────────────────────────────────────────────────
 def parse_movie_info(data):
-    info = {"name": "Unknown Movie", "language": ""}
+    info = {"name": "Unknown Movie", "language": "", "format": ""}
     for w in data.get("data", {}).get("topStickyWidgets", []):
         if w.get("type") == "horizontal-text-list":
             for item in w.get("data", []):
                 for row in item.get("leftText", {}).get("data", []):
                     for c in row.get("components", []):
                         if "•" in c.get("text", ""):
-                            info["language"] = "Hindi  •  DOLBY CINEMA 3D" # c["text"].strip()
+                            language, _, movie_format = c["text"].partition("•")
+                            info["language"] = language.strip()
+                            info["format"] = movie_format.strip()
     bs = data.get("data", {}).get("bottomSheetData", {})
     for w in bs.get("format-selector", {}).get("widgets", []):
         if w.get("type") == "vertical-text-list":
@@ -198,6 +203,30 @@ def parse_movie_info(data):
                 if d.get("styleId") == "bottomsheet-subtitle":
                     info["name"] = d.get("text", info["name"])
     return info
+
+
+def parse_variant_codes(data):
+    """Read event IDs only from this movie's language/format selector."""
+    sheets = data.get("data", {}).get("bottomSheetData", {})
+    codes = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(key)
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str):
+            # Selector actions can contain an ID, a URL, or encoded route data.
+            for code in re.findall(r"\bET\d{8,}\b", value):
+                if code not in codes:
+                    codes.append(code)
+
+    for name in ("format-selector", "language-selector"):
+        visit(sheets.get(name, {}))
+    return codes
 
 
 def parse_dates(data):
@@ -216,8 +245,13 @@ def parse_dates(data):
     return dates
 
 
-def parse_shows(data):
+def parse_shows(data, event_code="", date_code=""):
     shows = []
+    movie_info = parse_movie_info(data)
+    selected_date = next(
+        (d.date_code for d in parse_dates(data) if d.status == "BOOKABLE"),
+        "",
+    )
     for w in data.get("data", {}).get("showtimeWidgets", []):
         if w.get("type") != "groupList":
             continue
@@ -233,23 +267,26 @@ def parse_shows(data):
 
                 for st in card.get("showtimes", []):
                     sa = st.get("additionalData", {})
-                    date_code = str(
+                    show_date = str(
                         sa.get("showDateCode", "")
                         or sa.get("dateCode", "")
                     ).strip()
-                    if not date_code and re.match(
+                    if not show_date and re.match(
                             r"^\d{8}", sa.get("cutOffDateTime", "")):
-                        date_code = sa["cutOffDateTime"][:8]
+                        show_date = sa["cutOffDateTime"][:8]
 
                     show = ShowInfo(
                         venue_code=vcode,
                         venue_name=vname,
                         session_id=sa.get("sessionId", ""),
-                        date_code=date_code,
+                        date_code=show_date or date_code or selected_date,
                         time=st.get("title", ""),
                         time_code=sa.get("showTimeCode", ""),
                         screen_attr=(st.get("screenAttr", "")
                                      or sa.get("attributes", "")),
+                        event_code=event_code,
+                        language=movie_info["language"],
+                        format=movie_info["format"],
                     )
                     for cat in sa.get("categories", []):
                         ca = str(cat.get("availStatus", ""))
@@ -327,7 +364,10 @@ def build_state(shows, dates):
     show_state = {}
     for s in shows:
         for c in s.categories:
-            key = f"{s.venue_code}|{s.session_id}|{s.date_code}|{c.name}"
+            key = (
+                f"{s.event_code}|{s.venue_code}|{s.session_id}|"
+                f"{s.date_code}|{c.name}"
+            )
             show_state[key] = {
                 "venue": s.venue_name,
                 "time": s.time,
@@ -335,13 +375,40 @@ def build_state(shows, dates):
                 "cat": c.name,
                 "price": c.price,
                 "status": c.status,
+                "event_code": s.event_code,
+                "language": s.language,
+                "format": s.format,
             }
 
     date_state = {
-        d.date_code: d.status for d in dates
+        f"{event_code}|{d.date_code}": d.status
+        for event_code, d in dates
     }
 
     return {"shows": show_state, "dates": date_state}
+
+
+def migrate_state(state, event_code):
+    """Attribute the previous single-event state to the configured URL."""
+    return {
+        section: {
+            key if re.match(r"^ET\d{8,}\|", key)
+            else f"{event_code}|{key}": value
+            for key, value in state.get(section, {}).items()
+        }
+        for section in ("shows", "dates")
+    }
+
+
+def variant_label(language, movie_format):
+    return " / ".join(value for value in (language, movie_format) if value)
+
+
+def show_label(show):
+    label = variant_label(show.language, show.format) or show.event_code
+    if show.screen_attr:
+        label = " / ".join(value for value in (label, show.screen_attr) if value)
+    return f" [{label}]" if label else ""
 
 
 def detect_changes(old_state, new_state):
@@ -354,7 +421,10 @@ def detect_changes(old_state, new_state):
         old_status = old_dates.get(dc)
         if (old_status == "NOT_OPEN"
                 and status in ("BOOKABLE", "AVAILABLE")):
-            changes.append(f"📅 NEW DATE OPENED: {dc}")
+            event_code, _, date_code = dc.partition("|")
+            changes.append(
+                f"📅 NEW DATE OPENED: {date_code} [{event_code}]"
+            )
 
     old_shows = old_state.get("shows", {})
     new_shows = new_state.get("shows", {})
@@ -362,9 +432,11 @@ def detect_changes(old_state, new_state):
     # New showtimes
     for key in set(new_shows) - set(old_shows):
         s = new_shows[key]
+        label = variant_label(s.get("language", ""), s.get("format", ""))
+        label = label or s.get("event_code", "")
         changes.append(
             f"🆕 NEW: {s['venue']} {s['time']} [{s['date']}] "
-            f"— {s['cat']} ₹{s['price']}"
+            f"[{label}] — {s['cat']} ₹{s['price']}"
         )
 
     # Sold out → available
@@ -376,7 +448,9 @@ def detect_changes(old_state, new_state):
             )
             changes.append(
                 f"{ico} BACK: {new_s['venue']} {new_s['time']} "
-                f"[{new_s['date']}] — {new_s['cat']} → {lbl}"
+                f"[{new_s['date']}] "
+                f"[{variant_label(new_s.get('language', ''), new_s.get('format', '')) or new_s.get('event_code', '')}] "
+                f"— {new_s['cat']} → {lbl}"
             )
 
     return changes
@@ -429,12 +503,12 @@ def send_email(subject, changes, shows, movie_info):
                 f"{escape(c.name)} Rs.{escape(c.price)} ({_cat_status_label(c.status)})"
                 for c in s.categories
             )
-            fmt = f" [{escape(s.screen_attr)}]" if s.screen_attr else ""
+            fmt = escape(show_label(s))
             show_rows += (
                 f'<tr>'
                 f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;'
                 f'font-size:13px;vertical-align:top;">'
-                f'{escape(s.time)}{fmt}</td>'
+                f'{escape(s.date_code)} {escape(s.time)}{fmt}</td>'
                 f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;'
                 f'font-size:13px;vertical-align:top;">'
                 f'{cats}</td>'
@@ -448,7 +522,7 @@ def send_email(subject, changes, shows, movie_info):
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
             <tr style="background:#f5f5f5;">
                 <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #ddd;
-                           font-weight:bold;">Time</th>
+                           font-weight:bold;">Date / Time / Language / Format</th>
                 <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #ddd;
                            font-weight:bold;">Categories</th>
             </tr>
@@ -492,8 +566,9 @@ def send_email(subject, changes, shows, movie_info):
                 f"{c.name} Rs.{c.price} ({_cat_status_label(c.status)})"
                 for c in s.categories
             )
-            fmt = f" [{s.screen_attr}]" if s.screen_attr else ""
-            plain_lines.append(f"  {s.time}{fmt} - {cats}")
+            plain_lines.append(
+                f"  {s.date_code} {s.time}{show_label(s)} - {cats}"
+            )
     plain_lines.extend(["", "This is an automated alert from BMS Ticket Notifier."])
     plain = "\n".join(plain_lines)
 
@@ -554,29 +629,60 @@ def main():
     print(f"  Event: {event_code}  Region: {region_code}  "
           f"Dates: {date_list}")
 
-    # Fetch data for each date
+    # Each language/format can have its own event ID and date availability.
     all_shows = []
     all_dates = []
-    movie_info = {"name": "Unknown", "language": ""}
+    movie_info = None
+    event_codes = [event_code]
+    checked = set()
+    seen_shows = set()
 
-    for dc in date_list:
-        data = fetch_bms(event_code, dc, region_code,
-                         region_slug_r, lat, lon, geohash)
-        if not data:
-            print(f"  ⚠️  No data for date {dc or '(default)'}")
-            continue
+    for variant_code in event_codes:
+        for dc in dict.fromkeys(date_list):
+            if (variant_code, dc) in checked:
+                continue
+            checked.add((variant_code, dc))
+            data = fetch_bms(variant_code, dc, region_code,
+                             region_slug_r, lat, lon, geohash)
+            if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+                print(
+                    f"  ❌ Could not check {variant_code} "
+                    f"for date {dc or '(default)'}. State left unchanged."
+                )
+                sys.exit(1)
 
-        if movie_info["name"] == "Unknown":
-            movie_info = parse_movie_info(data)
+            info = parse_movie_info(data)
+            if movie_info is None:
+                movie_info = info
 
-        all_dates.extend(parse_dates(data))
-        all_shows.extend(parse_shows(data))
+            for code in parse_variant_codes(data):
+                if code not in event_codes:
+                    event_codes.append(code)
 
-    if not all_shows:
-        print("  ❌ No showtimes found.")
-        sys.exit(0)
+            all_dates.extend(
+                (variant_code, d) for d in parse_dates(data)
+            )
+            shows = parse_shows(data, variant_code, dc)
+            print(
+                f"  🎬 {info['name']} "
+                f"[{variant_label(info['language'], info['format']) or variant_code}]"
+                f"  Date: {dc or '(default)'}  Shows: {len(shows)}"
+            )
+            for show in shows:
+                key = (
+                    show.event_code, show.venue_code,
+                    show.session_id, show.date_code,
+                )
+                if key not in seen_shows:
+                    seen_shows.add(key)
+                    all_shows.append(show)
 
-    print(f"  🎬 {movie_info['name']}  {movie_info['language']}")
+    print(f"  Checked {len(event_codes)} language/format event(s).")
+    if len(event_codes) == 1:
+        print(
+            "  ⚠️  No alternate event IDs found in the format selector; "
+            "only the configured event could be checked."
+        )
 
     # Apply filters
     filtered = filter_shows(
@@ -589,13 +695,11 @@ def main():
 
     # Build state & detect changes
     new_state = build_state(filtered, all_dates)
-    old_state = load_state()
+    old_state = migrate_state(load_state(), event_code)
 
     changes = []
-    if old_state:
+    if old_state["shows"] or old_state["dates"]:
         changes = detect_changes(old_state, new_state)
-
-    save_state(new_state)
 
     if changes:
         print(f"\n  ⚡ {len(changes)} change(s) detected:")
@@ -608,6 +712,8 @@ def main():
     else:
         print("  ✅ No changes since last check.")
 
+    save_state(new_state)
+
     # Print current status
     print(f"\n  Current status ({len(filtered)} shows):")
     for s in filtered:
@@ -615,7 +721,7 @@ def main():
             f"{c.name}=₹{c.price}({AVAIL_STATUS_MAP.get(c.status, ('?',''))[0]})"
             for c in s.categories
         )
-        fmt = f"|{s.screen_attr}" if s.screen_attr else ""
+        fmt = show_label(s)
         print(f"    {s.venue_name} — {s.time}{fmt} [{s.date_code}] — {cats}")
 
     print("\n  Done.")
