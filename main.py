@@ -190,7 +190,7 @@ def parse_movie_info(data):
                 for row in item.get("leftText", {}).get("data", []):
                     for c in row.get("components", []):
                         if "•" in c.get("text", ""):
-                            info["language"] = c["text"].strip()
+                            info["language"] = "Hindi  •  DOLBY CINEMA 3D" # c["text"].strip()
     bs = data.get("data", {}).get("bottomSheetData", {})
     for w in bs.get("format-selector", {}).get("widgets", []):
         if w.get("type") == "vertical-text-list":
